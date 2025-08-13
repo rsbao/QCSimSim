@@ -191,55 +191,88 @@ class PerformanceSimulator:
             if t < self.local_qubits:
                 comm_time = bytes_per_device * 2 / mem_bandwidth + mem_latency
                 return max(compute_time, comm_time)  
+            # Needs communication within the node
             elif t < self.node_qubits:
-                # Needs communication within the node
                 # Partner bit within the intra-node partition:
                 distributed_bit = t - self.local_qubits
                 # Each device exchanges half of its local state with its XOR partner
                 bytes_per_partner = bytes_per_device // 2
                 comm_time = self._intra_node_comm_time(distributed_bit, bytes_per_partner)
                 return max(compute_time, comm_time)
+            # Inter-node distributed qubit
             else:
-                # Needs communication across nodes
-                comm_time = bytes_per_node * 2 / inter_node_bw + inter_node_latency
-                return max(compute_time, comm_time) + inter_node_latency
+                distributed_bit = t - self.node_qubits  # which network bit at the node level
+                bytes_per_partner = bytes_per_node // 2
+                comm_time = self._inter_node_comm_time(distributed_bit, bytes_per_partner)
+                return max(compute_time, comm_time)
 
-        # --- Two-qubit gates ---
-        t, c = targets
-        compute_time = 14 * 2**(self.circuit.num_qubits-1) / (self.hardware.flops_per_device * self.hardware.num_nodes)
-        # If qubits are on different nodes (i.e., their bits span partition)
-        if t < self.local_qubits:
-            if c < self.local_qubits:
-                # Both qubits are local
-                return max(compute_time,bytes_per_device / mem_bandwidth + mem_latency)  # Local 2-qubit gate
-            elif c < self.node_qubits:
-                # target is local, control is in node
-                return max(compute_time, bytes_per_device * 2 / mem_bandwidth + mem_latency) + intra_node_latency
-            else:
-                # target is local, control is remote
-                return max(compute_time, bytes_per_device * 2 / mem_bandwidth + mem_latency) + inter_node_latency
+        # # --- Two-qubit gates ---
+        # t, c = targets
+        # compute_time = 14 * 2**(self.circuit.num_qubits-1) / (self.hardware.flops_per_device * self.hardware.num_nodes)
+        # # If qubits are on different nodes (i.e., their bits span partition)
+        # if t < self.local_qubits:
+        #     if c < self.local_qubits:
+        #         # Both qubits are local
+        #         return max(compute_time,bytes_per_device / mem_bandwidth + mem_latency)  # Local 2-qubit gate
+        #     elif c < self.node_qubits:
+        #         # target is local, control is in node
+        #         return max(compute_time, bytes_per_device * 2 / mem_bandwidth + mem_latency) + intra_node_latency
+        #     else:
+        #         # target is local, control is remote
+        #         return max(compute_time, bytes_per_device * 2 / mem_bandwidth + mem_latency) + inter_node_latency
 
-        elif t < self.node_qubits:
-            if c < self.local_qubits:
-                # control is local, target is in node
-                return max(compute_time, bytes_per_device / intra_node_bw + intra_node_latency) + intra_node_latency
-            elif c < self.node_qubits:
-                # Both qubits are in node, but not local
-                return max(compute_time, bytes_per_device * 2 / intra_node_bw + intra_node_latency) + intra_node_latency
-            else:
-                # control is remote, target is in node
-                return max(compute_time, bytes_per_device * 2 / intra_node_bw + intra_node_latency) + intra_node_latency
-        else: 
-            if c < self.local_qubits:
-                # control is local, target is remote
-                return max(compute_time, bytes_per_node / inter_node_bw + inter_node_latency) + inter_node_latency
-            elif c < self.node_qubits:
-                # control is in node, target is remote
-                return max(compute_time, bytes_per_node / inter_node_bw + inter_node_latency) + inter_node_latency
-            else:
-                # Both qubits are remote
-                return max(compute_time, bytes_per_node * 2 / inter_node_bw + inter_node_latency) + inter_node_latency
+        # elif t < self.node_qubits:
+        #     if c < self.local_qubits:
+        #         # control is local, target is in node
+        #         return max(compute_time, bytes_per_device / intra_node_bw + intra_node_latency) + intra_node_latency
+        #     elif c < self.node_qubits:
+        #         # Both qubits are in node, but not local
+        #         return max(compute_time, bytes_per_device * 2 / intra_node_bw + intra_node_latency) + intra_node_latency
+        #     else:
+        #         # control is remote, target is in node
+        #         return max(compute_time, bytes_per_device * 2 / intra_node_bw + intra_node_latency) + intra_node_latency
+        # else: 
+        #     if c < self.local_qubits:
+        #         # control is local, target is remote
+        #         return max(compute_time, bytes_per_node / inter_node_bw + inter_node_latency) + inter_node_latency
+        #     elif c < self.node_qubits:
+        #         # control is in node, target is remote
+        #         return max(compute_time, bytes_per_node / inter_node_bw + inter_node_latency) + inter_node_latency
+        #     else:
+        #         # Both qubits are remote
+        #         return max(compute_time, bytes_per_node * 2 / inter_node_bw + inter_node_latency) + inter_node_latency
         
+        # --- Two-qubit gates ---
+        # model compute roughly half work per amplitude pair (similar scale to your 14*2^(n-1))
+        t, c = targets
+        compute_time = 14 * 2 ** (self.circuit.num_qubits - 1) / (self.hardware.flops_per_device * self.hardware.num_nodes)
+
+        # Cases break down by which partitions t/c belong to.
+        # If a gate *touches* any distributed partition, we model one XOR-exchange on that partition.
+        # (This is a common approximation for state-vector sims that use "on-the-fly" exchanges instead of explicit qubit remaps.)
+        def level(q):
+            if q < self.local_qubits: return "local"
+            if q < self.node_qubits:  return "intra"
+            return "inter"
+
+        lt, lc = level(t), level(c)
+
+        # Local target
+        if lt == "local":
+            if lc == "local":
+                comm_time = (bytes_per_device * 2 / mem_bandwidth) + mem_latency
+                return max(compute_time, comm_time)
+            else:
+                comm_time = (bytes_per_device / mem_bandwidth) + mem_latency
+                return max(compute_time, comm_time)
+        # Intra-node target
+        elif lt == "intra":
+            if lc == "local":
+                comm_time = 
+
+
+
+
     def simulate(self):
         total_time = 0.0
         total_comp_time = 0.0
